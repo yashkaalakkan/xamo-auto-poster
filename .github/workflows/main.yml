@@ -2,7 +2,7 @@ name: Xamo Auto Poster
 
 on:
   schedule:
-    - cron: '*/30 * * * *' # Runs every 30 minutes automatically
+    - cron: '0 * * * *' 
   workflow_dispatch: # Adds a button to let you run it manually
 
 jobs:
