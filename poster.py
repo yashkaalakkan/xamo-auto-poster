@@ -624,7 +624,9 @@ def run():
 
     log(f"Found {len(pending_rows)} row(s) needing IG/FB work: {pending_rows}")
 
-    for row_num in pending_rows:
+    rows_to_process_this_run = pending_rows[:1]  # HARD CAP: only ONE row per run for IG/FB
+
+    for row_num in rows_to_process_this_run:
         row = get_row_dict(ws, row_num)
         video_filename = row["VideoFilename"]
         caption = row["Caption"] or ""
@@ -664,7 +666,7 @@ def run():
             row = get_row_dict(ws, row_num)
             if row["VideoFilename"] is None:
                 continue
-            if row["YT_Status"] not in DONE_STATES:
+            if row["IG_Status"] == "posted" and row["FB_Status"] == "posted" and row["YT_Status"] not in DONE_STATES:
                 yt_eligible_rows.append(row_num)
 
         # Stamp YT_FirstPendingAt for any row seeing this for the first time
