@@ -204,7 +204,7 @@ COLUMNS = [
     "ID", "VideoFilename", "Caption", "YT_Title", "Hashtags",
     "IG_Status", "FB_Status", "YT_Status",
     "IG_Fails", "FB_Fails", "YT_Fails",
-    "IG_PostedAt", "FB_PostedAt", "YT_PostedAt",
+    "IG_PostedAt", "FB_PostedAt", "YT_PostedAt", "YT_FirstPendingAt",
 ]
 
 DONE_STATES = ("posted", "skipped_error")
@@ -504,21 +504,19 @@ def post_to_youtube(video_local_path, yt_title, caption):
         return False
 
 
-def yt_upload_allowed(quota_data):
+def yt_batch_timing_allowed(quota_data):
+    """Only checks the 4-hour spacing timer - NOT the daily count.
+    Quota count is checked separately per-video during the batch."""
     today_str = datetime.now(timezone.utc).date().isoformat()
     if quota_data.get("date") != today_str:
         quota_data["date"] = today_str
         quota_data["count"] = 0
-
-    if quota_data["count"] >= YT_MAX_UPLOADS_PER_DAY:
-        return False, quota_data
 
     last_post_time = quota_data.get("last_post_time")
     if last_post_time:
         last_dt = datetime.fromisoformat(last_post_time)
         if datetime.now(timezone.utc) - last_dt < timedelta(hours=YT_MIN_HOURS_BETWEEN_POSTS):
             return False, quota_data
-
     return True, quota_data
 
 
@@ -578,17 +576,27 @@ def attempt_platform(ws, row_num, row, status_col, fails_col, posted_at_col,
     return True  # was attempted
 
 
+def find_video_anywhere(drive, videos_folder_id, posted_folder_id, filename):
+    """Looks in /videos first, then /posted, since IG+FB may have already
+    moved the file by the time YouTube's batch gets to it."""
+    file_id = find_file_in_folder(drive, videos_folder_id, filename)
+    if file_id:
+        return file_id
+    return find_file_in_folder(drive, posted_folder_id, filename)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+YT_BACKLOG_MAX_DAYS = 3  # give up on a video for YT after this many days waiting
+
 
 def run():
     log("Starting poster run.")
     drive = get_drive_service()
 
-    # IG token refresh (safe: never raises, alerts on failure, keeps old token)
     ig_access_token = maybe_refresh_ig_token(drive)
-    # ig_access_token = IG_ACCESS_TOKEN
 
     videos_folder_id = find_child_folder(drive, DRIVE_FOLDER_ID, VIDEOS_SUBFOLDER)
     posted_folder_id = find_child_folder(drive, DRIVE_FOLDER_ID, POSTED_SUBFOLDER)
@@ -603,72 +611,131 @@ def run():
     download_file(drive, queue_file_id, local_queue_path)
     wb, ws = load_queue(local_queue_path)
 
-    row_num = find_next_pending_row(ws)
-    if row_num is None:
-        log("No pending rows found. Nothing to do this run.")
-        ping_healthcheck(success=True, message="No pending rows")
-        return
-
-    row = get_row_dict(ws, row_num)
-    video_filename = row["VideoFilename"]
-    caption = row["Caption"] or ""
-    yt_title = row["YT_Title"] or video_filename
-
-    log(f"Working on row {row_num}: {video_filename}")
-
-    video_file_id = find_file_in_folder(drive, videos_folder_id, video_filename)
-    if not video_file_id:
-        log(f"ERROR: video file '{video_filename}' not found in /videos folder.")
-        ping_healthcheck(success=False, message=f"Missing video file: {video_filename}")
-        sys.exit(1)
-
-    local_video_path = os.path.join(LOCAL_WORKDIR, video_filename)
-    download_file(drive, video_file_id, local_video_path)
-
     any_attempted = False
 
-    any_attempted |= attempt_platform(
-        ws, row_num, row, "IG_Status", "IG_Fails", "IG_PostedAt", "Instagram",
-        lambda: post_to_instagram(local_video_path, caption, ig_access_token),
-    )
+    # ---------------- IG + FB: drives the queue forward, unaffected by YT ----------------
+    pending_rows = []
+    for row_num in range(2, ws.max_row + 1):
+        row = get_row_dict(ws, row_num)
+        if row["VideoFilename"] is None:
+            continue
+        if row["IG_Status"] not in DONE_STATES or row["FB_Status"] not in DONE_STATES:
+            pending_rows.append(row_num)
 
-    any_attempted |= attempt_platform(
-        ws, row_num, row, "FB_Status", "FB_Fails", "FB_PostedAt", "Facebook",
-        lambda: post_to_facebook_page(local_video_path, caption),
-    )
+    log(f"Found {len(pending_rows)} row(s) needing IG/FB work: {pending_rows}")
 
-    if row["YT_Status"] not in DONE_STATES:
-        quota_data, quota_file_id = load_json_state(
-            drive, DRIVE_FOLDER_ID, YT_QUOTA_FILENAME, {"date": None, "count": 0, "last_post_time": None}
+    for row_num in pending_rows:
+        row = get_row_dict(ws, row_num)
+        video_filename = row["VideoFilename"]
+        caption = row["Caption"] or ""
+
+        video_file_id = find_file_in_folder(drive, videos_folder_id, video_filename)
+        if not video_file_id:
+            log(f"ERROR: video file '{video_filename}' not found in /videos. Skipping row {row_num}.")
+            continue
+
+        local_video_path = os.path.join(LOCAL_WORKDIR, video_filename)
+        download_file(drive, video_file_id, local_video_path)
+
+        any_attempted |= attempt_platform(
+            ws, row_num, row, "IG_Status", "IG_Fails", "IG_PostedAt", "Instagram",
+            lambda: post_to_instagram(local_video_path, caption, ig_access_token),
         )
-        allowed, quota_data = yt_upload_allowed(quota_data)
-        if allowed:
+        any_attempted |= attempt_platform(
+            ws, row_num, row, "FB_Status", "FB_Fails", "FB_PostedAt", "Facebook",
+            lambda: post_to_facebook_page(local_video_path, caption),
+        )
+
+        row_after = get_row_dict(ws, row_num)
+        if row_after["IG_Status"] == "posted" and row_after["FB_Status"] == "posted":
+            log(f"Row {row_num}: IG+FB done - moving to /posted.")
+            move_file(drive, video_file_id, videos_folder_id, posted_folder_id)
+
+    # ---------------- YouTube: batch, every ~4 hours, across ALL eligible rows ----------------
+    quota_data, quota_file_id = load_json_state(
+        drive, DRIVE_FOLDER_ID, YT_QUOTA_FILENAME, {"date": None, "count": 0, "last_post_time": None}
+    )
+    allowed_by_time, quota_data = yt_batch_timing_allowed(quota_data)
+
+    if allowed_by_time:
+        log("YT batch window is open - scanning for all eligible rows.")
+        yt_eligible_rows = []
+        for row_num in range(2, ws.max_row + 1):
+            row = get_row_dict(ws, row_num)
+            if row["VideoFilename"] is None:
+                continue
+            if row["YT_Status"] not in DONE_STATES:
+                yt_eligible_rows.append(row_num)
+
+        # Stamp YT_FirstPendingAt for any row seeing this for the first time
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for row_num in yt_eligible_rows:
+            if ws.cell(row=row_num, column=col_index("YT_FirstPendingAt")).value is None:
+                set_cell(ws, row_num, "YT_FirstPendingAt", now_iso)
+
+        remaining_quota = YT_MAX_UPLOADS_PER_DAY - quota_data.get("count", 0)
+        log(f"YT eligible rows: {yt_eligible_rows}. Remaining quota today: {remaining_quota}")
+
+        for row_num in yt_eligible_rows:
+            row = get_row_dict(ws, row_num)
+            video_filename = row["VideoFilename"]
+            yt_title = row["YT_Title"] or video_filename
+            caption = row["Caption"] or ""
+
+            # Give up if this row has been waiting too long
+            first_pending = ws.cell(row=row_num, column=col_index("YT_FirstPendingAt")).value
+            if first_pending:
+                age_days = (datetime.now(timezone.utc) - datetime.fromisoformat(first_pending)).days
+                if age_days >= YT_BACKLOG_MAX_DAYS:
+                    set_cell(ws, row_num, "YT_Status", "skipped_error")
+                    log(f"Row {row_num}: YT backlog exceeded {YT_BACKLOG_MAX_DAYS} days - giving up.")
+                    send_alert(
+                        "YouTube video skipped (backlog too old)",
+                        f"Row {row_num} ({video_filename}) waited {age_days} days for a YouTube "
+                        f"upload slot and has been marked 'skipped_error'. It will not be retried.",
+                    )
+                    continue
+
+            if remaining_quota <= 0:
+                set_cell(ws, row_num, "YT_Status", "waiting_quota")
+                log(f"Row {row_num}: daily YT quota exhausted, marked 'waiting_quota'.")
+                continue
+
+            video_file_id = find_video_anywhere(drive, videos_folder_id, posted_folder_id, video_filename)
+            if not video_file_id:
+                log(f"ERROR: video file '{video_filename}' not found anywhere for YT. Skipping row {row_num}.")
+                continue
+
+            local_video_path = os.path.join(LOCAL_WORKDIR, video_filename)
+            download_file(drive, video_file_id, local_video_path)
+
             def yt_post_and_record():
                 ok = post_to_youtube(local_video_path, yt_title, caption)
                 if ok:
-                    nonlocal quota_data
+                    nonlocal quota_data, remaining_quota
                     quota_data = yt_record_upload(quota_data)
+                    remaining_quota -= 1
                 return ok
 
-            any_attempted |= attempt_platform(
+            attempted = attempt_platform(
                 ws, row_num, row, "YT_Status", "YT_Fails", "YT_PostedAt", "YouTube",
                 yt_post_and_record,
             )
-            save_json_state(drive, DRIVE_FOLDER_ID, YT_QUOTA_FILENAME, quota_data, quota_file_id)
-        else:
-            log("YouTube skipped this run (daily quota reached or spacing not yet elapsed).")
+            if attempted:
+                any_attempted = True
+
+        quota_data["last_post_time"] = datetime.now(timezone.utc).isoformat()
+        save_json_state(drive, DRIVE_FOLDER_ID, YT_QUOTA_FILENAME, quota_data, quota_file_id)
+    else:
+        log("YT batch window not open yet this run (spacing).")
 
     wb.save(local_queue_path)
     upload_or_replace_file(drive, DRIVE_FOLDER_ID, QUEUE_FILENAME, local_queue_path, existing_file_id=queue_file_id)
 
-    if row_fully_posted(ws, row_num):
-        log(f"Row {row_num} fully posted on all platforms - moving video to /posted.")
-        move_file(drive, video_file_id, videos_folder_id, posted_folder_id)
-
     if any_attempted:
-        ping_healthcheck(success=True, message=f"Processed row {row_num} ({video_filename})")
+        ping_healthcheck(success=True, message="Run completed with activity")
     else:
-        ping_healthcheck(success=True, message="Nothing needed posting this run (e.g. YT gated)")
+        ping_healthcheck(success=True, message="Nothing needed posting this run")
 
     log("Run complete.")
 
