@@ -23,7 +23,6 @@ from nacl import encoding, public
 
 IG_USER_ID = os.environ["IG_USER_ID"]
 IG_ACCESS_TOKEN = os.environ["IG_ACCESS_TOKEN"]
-print(f"DEBUG: IG token length={len(IG_ACCESS_TOKEN)}, starts='{IG_ACCESS_TOKEN[:10]}', ends='{IG_ACCESS_TOKEN[-10:]}', repr_sample={repr(IG_ACCESS_TOKEN[:20])}")
 FB_APP_ID = os.environ["FB_APP_ID"]
 FB_APP_SECRET = os.environ["FB_APP_SECRET"]
 
@@ -51,19 +50,20 @@ CALLMEBOT_APIKEY = os.environ["CALLMEBOT_APIKEY"]
 GH_PAT = os.environ["GH_PAT"]
 GH_REPO = os.environ["GITHUB_REPOSITORY"]  # auto-provided by Actions, e.g. "user/xamo-auto-poster"
 
-# YouTube quota safety settings: 5 uploads/day, spaced >=4hrs apart
-YT_MAX_UPLOADS_PER_DAY = 5
-YT_MIN_HOURS_BETWEEN_POSTS = 4
+# YouTube quota safety settings
+YT_MIN_HOURS_BETWEEN_SWEEPS = 4  # a "sweep" = one batch of YT uploads
 
 # IG long-lived token: refresh proactively well before the real 60-day expiry
 IG_TOKEN_REFRESH_AFTER_DAYS = 50
 
-# A platform gets marked "skipped_error" (and stops being retried) after this many failures
+# A platform gets marked "skipped_error" (and stops being retried) after this many failures.
+# NOTE: this 3-strikes rule applies to IG and FB only. YouTube failures during a sweep
+# are simply labeled "failed" permanently (see run() for why) and are never retried.
 MAX_FAILURES_PER_PLATFORM = 3
 
 QUEUE_FILENAME = "queue.xlsx"
-YT_QUOTA_FILENAME = "yt_quota.json"
 TOKEN_STATE_FILENAME = "token_state.json"
+YT_SWEEP_STATE_FILENAME = "yt_sweep_state.json"
 VIDEOS_SUBFOLDER = "videos"
 POSTED_SUBFOLDER = "posted"
 
@@ -200,14 +200,22 @@ def save_json_state(drive, folder_id, filename, data, file_id):
 # Queue (queue.xlsx) helpers
 # ---------------------------------------------------------------------------
 
+# NOTE on statuses per platform (IG_Status / FB_Status / YT_Status):
+#   None / "" / "not_attempted"  -> never touched yet
+#   "failed"                     -> attempted, failed, still eligible for retry
+#                                    (IG/FB: retried until 3 fails; YT: never retried
+#                                    again since the sweep marker has moved past it)
+#   "posted"                     -> succeeded
+#   "skipped_error"              -> IG/FB only: hit 3 fails, permanently excluded
 COLUMNS = [
     "ID", "VideoFilename", "Caption", "YT_Title", "Hashtags",
     "IG_Status", "FB_Status", "YT_Status",
     "IG_Fails", "FB_Fails", "YT_Fails",
-    "IG_PostedAt", "FB_PostedAt", "YT_PostedAt", "YT_FirstPendingAt",
+    "IG_PostedAt", "FB_PostedAt", "YT_PostedAt",
 ]
 
 DONE_STATES = ("posted", "skipped_error")
+NOT_ATTEMPTED_STATES = (None, "", "not_attempted")
 
 
 def col_index(name):
@@ -228,26 +236,16 @@ def set_cell(ws, row_num, col_name, value):
     ws.cell(row=row_num, column=col_index(col_name), value=value)
 
 
-def find_next_pending_row(ws):
-    """First row where at least one platform hasn't reached a DONE state yet."""
+def all_data_rows(ws):
+    """Yields (row_num, row_dict) for every row that actually has a video."""
     for row_num in range(2, ws.max_row + 1):
         row = get_row_dict(ws, row_num)
-        if row["VideoFilename"] is None:
-            continue
-        statuses = [row["IG_Status"], row["FB_Status"], row["YT_Status"]]
-        if any(s not in DONE_STATES for s in statuses):
-            return row_num
-    return None
+        if row["VideoFilename"] is not None:
+            yield row_num, row
 
 
-def row_fully_posted(ws, row_num):
-    """True only if ALL three actually posted (not just done-via-skip)."""
-    row = get_row_dict(ws, row_num)
-    return all(row[s] == "posted" for s in ["IG_Status", "FB_Status", "YT_Status"])
-
-
-def record_platform_result(ws, row_num, platform_prefix, success, row_num_video, row_num_video_name):
-    pass  # placeholder not used; logic handled inline in main() for clarity
+def row_fully_posted(row):
+    return row["IG_Status"] == "posted" and row["FB_Status"] == "posted" and row["YT_Status"] == "posted"
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +443,7 @@ def post_to_instagram(video_local_path, caption, access_token):
         delete_github_release_asset(asset_id)
         log("IG: cleaned up temporary hosted video.")
 
+
 # ---------------------------------------------------------------------------
 # Facebook Page posting
 # ---------------------------------------------------------------------------
@@ -466,7 +465,7 @@ def post_to_facebook_page(video_local_path, caption):
 
 
 # ---------------------------------------------------------------------------
-# YouTube posting + quota
+# YouTube posting
 # ---------------------------------------------------------------------------
 
 def get_youtube_service():
@@ -481,7 +480,11 @@ def get_youtube_service():
     return build("youtube", "v3", credentials=creds)
 
 
-def post_to_youtube(video_local_path, yt_title, caption):
+def post_to_youtube(video_local_path, yt_title, caption, publish_at_iso):
+    """publish_at_iso: RFC3339 UTC timestamp (e.g. '2026-07-26T14:00:00Z').
+    Uploads now, but the video is scheduled (privacyStatus='private' +
+    publishAt) to go public at that time -- this is how we stagger visibility
+    for videos that are all actually uploaded in the same sweep."""
     try:
         youtube = get_youtube_service()
         body = {
@@ -490,40 +493,22 @@ def post_to_youtube(video_local_path, yt_title, caption):
                 "description": caption,
                 "categoryId": "22",
             },
-            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
+            "status": {
+                "privacyStatus": "private",
+                "publishAt": publish_at_iso,
+                "selfDeclaredMadeForKids": False,
+            },
         }
         media = MediaFileUpload(video_local_path, chunksize=-1, resumable=True, mimetype="video/mp4")
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
         response = None
         while response is None:
             status, response = request.next_chunk()
-        log(f"YT: uploaded successfully, video id {response['id']}")
+        log(f"YT: uploaded successfully, video id {response['id']}, scheduled for {publish_at_iso}")
         return True
     except Exception as e:
         log(f"YT: upload failed: {e}")
         return False
-
-
-def yt_batch_timing_allowed(quota_data):
-    """Only checks the 4-hour spacing timer - NOT the daily count.
-    Quota count is checked separately per-video during the batch."""
-    today_str = datetime.now(timezone.utc).date().isoformat()
-    if quota_data.get("date") != today_str:
-        quota_data["date"] = today_str
-        quota_data["count"] = 0
-
-    last_post_time = quota_data.get("last_post_time")
-    if last_post_time:
-        last_dt = datetime.fromisoformat(last_post_time)
-        if datetime.now(timezone.utc) - last_dt < timedelta(hours=YT_MIN_HOURS_BETWEEN_POSTS):
-            return False, quota_data
-    return True, quota_data
-
-
-def yt_record_upload(quota_data):
-    quota_data["count"] = quota_data.get("count", 0) + 1
-    quota_data["last_post_time"] = datetime.now(timezone.utc).isoformat()
-    return quota_data
 
 
 # ---------------------------------------------------------------------------
@@ -539,18 +524,18 @@ def ping_healthcheck(success=True, message=""):
 
 
 # ---------------------------------------------------------------------------
-# Per-platform attempt helper (handles retry counting + skip-after-N)
+# Per-platform attempt helper (IG / FB: retry counting + skip-after-N)
 # ---------------------------------------------------------------------------
 
-def attempt_platform(ws, row_num, row, status_col, fails_col, posted_at_col,
-                      platform_label, post_fn):
-    """Runs post_fn() if this platform isn't already done. Updates status,
-    failure count, and posted-at timestamp. Sends an alert + marks
-    skipped_error if MAX_FAILURES_PER_PLATFORM is reached."""
+def attempt_platform_with_retries(ws, row_num, row, status_col, fails_col, posted_at_col,
+                                   platform_label, post_fn):
+    """Used for IG and FB. Runs post_fn() if this platform isn't already
+    done. Updates status, failure count, and posted-at timestamp. Sends an
+    alert + marks skipped_error if MAX_FAILURES_PER_PLATFORM is reached."""
     if row[status_col] in DONE_STATES:
         return False  # nothing to do, not attempted
 
-    log(f"Attempting {platform_label} post...")
+    log(f"Attempting {platform_label} post for row {row_num}...")
     success = post_fn()
 
     if success:
@@ -576,9 +561,32 @@ def attempt_platform(ws, row_num, row, status_col, fails_col, posted_at_col,
     return True  # was attempted
 
 
+def attempt_youtube_no_retry(ws, row_num, row, post_fn):
+    """Used for YT sweeps only. No fail-count tracking, no skipped_error --
+    on failure we just label 'failed' and move on for good (per design, the
+    sweep marker moves past this row regardless and it will never be
+    revisited)."""
+    if row["YT_Status"] in DONE_STATES:
+        return False
+
+    log(f"Attempting YouTube post for row {row_num}...")
+    success = post_fn()
+
+    if success:
+        set_cell(ws, row_num, "YT_Status", "posted")
+        set_cell(ws, row_num, "YT_PostedAt", datetime.now(timezone.utc).isoformat())
+    else:
+        set_cell(ws, row_num, "YT_Status", "failed")
+        log(f"YouTube: row {row_num} failed this sweep -- will not be retried (marker moves past it).")
+
+    return True
+
+
 def find_video_anywhere(drive, videos_folder_id, posted_folder_id, filename):
     """Looks in /videos first, then /posted, since IG+FB may have already
-    moved the file by the time YouTube's batch gets to it."""
+    moved the file by the time YT's sweep gets to it (shouldn't normally
+    happen now that moves only occur once ALL three platforms are posted,
+    but kept as a safety net)."""
     file_id = find_file_in_folder(drive, videos_folder_id, filename)
     if file_id:
         return file_id
@@ -588,9 +596,6 @@ def find_video_anywhere(drive, videos_folder_id, posted_folder_id, filename):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
-YT_BACKLOG_MAX_DAYS = 3  # give up on a video for YT after this many days waiting
-
 
 def run():
     log("Starting poster run.")
@@ -613,20 +618,39 @@ def run():
 
     any_attempted = False
 
-    # ---------------- IG + FB: drives the queue forward, unaffected by YT ----------------
-    pending_rows = []
-    for row_num in range(2, ws.max_row + 1):
-        row = get_row_dict(ws, row_num)
-        if row["VideoFilename"] is None:
-            continue
-        if row["IG_Status"] not in DONE_STATES or row["FB_Status"] not in DONE_STATES:
-            pending_rows.append(row_num)
+    # =======================================================================
+    # LANE 1: IG + FB
+    #   - "current row" = the FIRST row that has never been attempted at all
+    #     on EITHER IG or FB (i.e. both are in NOT_ATTEMPTED_STATES).
+    #   - Rows after the current row are not touched this run, period.
+    #   - After processing the current row, go back and retry every row
+    #     BEFORE it that's still pending (status == "failed", not yet
+    #     skipped_error, not yet posted) on IG and/or FB.
+    # =======================================================================
+    current_row_num = None
+    for row_num, row in all_data_rows(ws):
+        if row["IG_Status"] in NOT_ATTEMPTED_STATES and row["FB_Status"] in NOT_ATTEMPTED_STATES:
+            current_row_num = row_num
+            break
 
-    log(f"Found {len(pending_rows)} row(s) needing IG/FB work: {pending_rows}")
+    if current_row_num is None:
+        log("No untouched row found for IG/FB -- nothing new to start this run.")
+    else:
+        log(f"Current row for this run (IG/FB): {current_row_num}")
 
-    rows_to_process_this_run = pending_rows[:1]  # HARD CAP: only ONE row per run for IG/FB
+    # Backlog: earlier rows still pending on IG and/or FB (status == "failed").
+    backlog_row_nums = []
+    if current_row_num is not None:
+        for row_num, row in all_data_rows(ws):
+            if row_num >= current_row_num:
+                break
+            if row["IG_Status"] not in DONE_STATES or row["FB_Status"] not in DONE_STATES:
+                backlog_row_nums.append(row_num)
 
-    for row_num in rows_to_process_this_run:
+    ig_fb_row_nums = ([current_row_num] if current_row_num is not None else []) + backlog_row_nums
+    log(f"IG/FB rows to process this run (current + backlog): {ig_fb_row_nums}")
+
+    for row_num in ig_fb_row_nums:
         row = get_row_dict(ws, row_num)
         video_filename = row["VideoFilename"]
         caption = row["Caption"] or ""
@@ -639,69 +663,64 @@ def run():
         local_video_path = os.path.join(LOCAL_WORKDIR, video_filename)
         download_file(drive, video_file_id, local_video_path)
 
-        any_attempted |= attempt_platform(
+        any_attempted |= attempt_platform_with_retries(
             ws, row_num, row, "IG_Status", "IG_Fails", "IG_PostedAt", "Instagram",
             lambda: post_to_instagram(local_video_path, caption, ig_access_token),
         )
-        any_attempted |= attempt_platform(
+        any_attempted |= attempt_platform_with_retries(
             ws, row_num, row, "FB_Status", "FB_Fails", "FB_PostedAt", "Facebook",
             lambda: post_to_facebook_page(local_video_path, caption),
         )
 
-        row_after = get_row_dict(ws, row_num)
-        if row_after["IG_Status"] == "posted" and row_after["FB_Status"] == "posted":
-            log(f"Row {row_num}: IG+FB done - moving to /posted.")
-            move_file(drive, video_file_id, videos_folder_id, posted_folder_id)
-
-    # ---------------- YouTube: batch, every ~4 hours, across ALL eligible rows ----------------
-    quota_data, quota_file_id = load_json_state(
-        drive, DRIVE_FOLDER_ID, YT_QUOTA_FILENAME, {"date": None, "count": 0, "last_post_time": None}
+    # =======================================================================
+    # LANE 2: YouTube -- time-marker-based sweep, every ~4 hours.
+    #   - Persist yt_last_swept_row (the row index up through which we've
+    #     already swept) and yt_last_swept_at (timestamp of that sweep).
+    #   - If now - yt_last_swept_at >= 4h: sweep every row strictly AFTER
+    #     yt_last_swept_row, up through and including the current IG/FB row
+    #     (current_row_num) -- however many that is.
+    #   - Each row in the sweep gets one attempt, no retries later
+    #     (attempt_youtube_no_retry). Regardless of success/failure, the
+    #     marker advances to current_row_num / now once the sweep runs.
+    #   - Videos are all uploaded in this same run; visibility is staggered
+    #     via YouTube's publishAt (now, +1h, +2h, +3h, ... in row order).
+    # =======================================================================
+    sweep_state, sweep_state_file_id = load_json_state(
+        drive, DRIVE_FOLDER_ID, YT_SWEEP_STATE_FILENAME,
+        {"yt_last_swept_row": 1, "yt_last_swept_at": None},  # row 1 = header, i.e. "nothing swept yet"
     )
-    allowed_by_time, quota_data = yt_batch_timing_allowed(quota_data)
 
-    if allowed_by_time:
-        log("YT batch window is open - scanning for all eligible rows.")
-        yt_eligible_rows = []
-        for row_num in range(2, ws.max_row + 1):
-            row = get_row_dict(ws, row_num)
-            if row["VideoFilename"] is None:
+    last_swept_row = sweep_state.get("yt_last_swept_row", 1)
+    last_swept_at = sweep_state.get("yt_last_swept_at")
+
+    sweep_due = True
+    if last_swept_at:
+        last_dt = datetime.fromisoformat(last_swept_at)
+        sweep_due = (datetime.now(timezone.utc) - last_dt) >= timedelta(hours=YT_MIN_HOURS_BETWEEN_SWEEPS)
+
+    if not sweep_due:
+        log("YT sweep not due yet (last sweep < 4h ago) -- skipping YT this run.")
+    elif current_row_num is None:
+        log("YT sweep is due, but there's no current IG/FB row yet -- nothing to sweep.")
+    else:
+        yt_sweep_row_nums = []
+        for row_num, row in all_data_rows(ws):
+            if row_num <= last_swept_row:
                 continue
+            if row_num > current_row_num:
+                break
+            # Only rows that are IG+FB posted are eligible for YT at all.
             if row["IG_Status"] == "posted" and row["FB_Status"] == "posted" and row["YT_Status"] not in DONE_STATES:
-                yt_eligible_rows.append(row_num)
+                yt_sweep_row_nums.append(row_num)
 
-        # Stamp YT_FirstPendingAt for any row seeing this for the first time
-        now_iso = datetime.now(timezone.utc).isoformat()
-        for row_num in yt_eligible_rows:
-            if ws.cell(row=row_num, column=col_index("YT_FirstPendingAt")).value is None:
-                set_cell(ws, row_num, "YT_FirstPendingAt", now_iso)
+        log(f"YT sweep is due. Rows in this sweep: {yt_sweep_row_nums}")
 
-        remaining_quota = YT_MAX_UPLOADS_PER_DAY - quota_data.get("count", 0)
-        log(f"YT eligible rows: {yt_eligible_rows}. Remaining quota today: {remaining_quota}")
-
-        for row_num in yt_eligible_rows:
+        now = datetime.now(timezone.utc)
+        for offset, row_num in enumerate(yt_sweep_row_nums):
             row = get_row_dict(ws, row_num)
             video_filename = row["VideoFilename"]
             yt_title = row["YT_Title"] or video_filename
             caption = row["Caption"] or ""
-
-            # Give up if this row has been waiting too long
-            first_pending = ws.cell(row=row_num, column=col_index("YT_FirstPendingAt")).value
-            if first_pending:
-                age_days = (datetime.now(timezone.utc) - datetime.fromisoformat(first_pending)).days
-                if age_days >= YT_BACKLOG_MAX_DAYS:
-                    set_cell(ws, row_num, "YT_Status", "skipped_error")
-                    log(f"Row {row_num}: YT backlog exceeded {YT_BACKLOG_MAX_DAYS} days - giving up.")
-                    send_alert(
-                        "YouTube video skipped (backlog too old)",
-                        f"Row {row_num} ({video_filename}) waited {age_days} days for a YouTube "
-                        f"upload slot and has been marked 'skipped_error'. It will not be retried.",
-                    )
-                    continue
-
-            if remaining_quota <= 0:
-                set_cell(ws, row_num, "YT_Status", "waiting_quota")
-                log(f"Row {row_num}: daily YT quota exhausted, marked 'waiting_quota'.")
-                continue
 
             video_file_id = find_video_anywhere(drive, videos_folder_id, posted_folder_id, video_filename)
             if not video_file_id:
@@ -711,25 +730,33 @@ def run():
             local_video_path = os.path.join(LOCAL_WORKDIR, video_filename)
             download_file(drive, video_file_id, local_video_path)
 
-            def yt_post_and_record():
-                ok = post_to_youtube(local_video_path, yt_title, caption)
-                if ok:
-                    nonlocal quota_data, remaining_quota
-                    quota_data = yt_record_upload(quota_data)
-                    remaining_quota -= 1
-                return ok
+            publish_at = now + timedelta(hours=offset)
+            publish_at_iso = publish_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-            attempted = attempt_platform(
-                ws, row_num, row, "YT_Status", "YT_Fails", "YT_PostedAt", "YouTube",
-                yt_post_and_record,
+            attempted = attempt_youtube_no_retry(
+                ws, row_num, row,
+                lambda: post_to_youtube(local_video_path, yt_title, caption, publish_at_iso),
             )
             if attempted:
                 any_attempted = True
 
-        quota_data["last_post_time"] = datetime.now(timezone.utc).isoformat()
-        save_json_state(drive, DRIVE_FOLDER_ID, YT_QUOTA_FILENAME, quota_data, quota_file_id)
-    else:
-        log("YT batch window not open yet this run (spacing).")
+        # Marker advances regardless of per-row success/failure -- this is
+        # what makes failed rows in this sweep "abandoned" going forward.
+        sweep_state["yt_last_swept_row"] = current_row_num
+        sweep_state["yt_last_swept_at"] = datetime.now(timezone.utc).isoformat()
+        save_json_state(drive, DRIVE_FOLDER_ID, YT_SWEEP_STATE_FILENAME, sweep_state, sweep_state_file_id)
+
+    # =======================================================================
+    # Completion sweep: any row now fully posted on IG+FB+YT gets its video
+    # moved from /videos to /posted.
+    # =======================================================================
+    for row_num, row in all_data_rows(ws):
+        if row_fully_posted(row):
+            video_filename = row["VideoFilename"]
+            video_file_id = find_file_in_folder(drive, videos_folder_id, video_filename)
+            if video_file_id:
+                log(f"Row {row_num}: fully posted on IG+FB+YT -- moving '{video_filename}' to /posted.")
+                move_file(drive, video_file_id, videos_folder_id, posted_folder_id)
 
     wb.save(local_queue_path)
     upload_or_replace_file(drive, DRIVE_FOLDER_ID, QUEUE_FILENAME, local_queue_path, existing_file_id=queue_file_id)
