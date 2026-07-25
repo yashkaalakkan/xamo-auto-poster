@@ -346,7 +346,7 @@ def maybe_refresh_ig_token(drive):
 # ---------------------------------------------------------------------------
 
 def post_to_instagram(video_local_path, caption, access_token):
-    base_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+    base_url = "https://graph.instagram.com"  # CHANGED: was graph.facebook.com
 
     create_resp = requests.post(
         f"{base_url}/{IG_USER_ID}/media",
@@ -369,7 +369,7 @@ def post_to_instagram(video_local_path, caption, access_token):
         video_bytes = f.read()
 
     upload_resp = requests.post(
-        f"https://rupload.facebook.com/{GRAPH_API_VERSION}/{container_id}",
+        f"https://rupload.facebook.com/ig-api-upload/{GRAPH_API_VERSION}/{container_id}",  # CHANGED: added ig-api-upload/
         headers={
             "Authorization": f"OAuth {access_token}",
             "offset": "0",
@@ -555,8 +555,8 @@ def run():
     drive = get_drive_service()
 
     # IG token refresh (safe: never raises, alerts on failure, keeps old token)
-    # ig_access_token = maybe_refresh_ig_token(drive)
-    ig_access_token = IG_ACCESS_TOKEN
+    ig_access_token = maybe_refresh_ig_token(drive)
+    # ig_access_token = IG_ACCESS_TOKEN
 
     videos_folder_id = find_child_folder(drive, DRIVE_FOLDER_ID, VIDEOS_SUBFOLDER)
     posted_folder_id = find_child_folder(drive, DRIVE_FOLDER_ID, POSTED_SUBFOLDER)
