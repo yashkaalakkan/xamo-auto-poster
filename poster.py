@@ -554,7 +554,8 @@ def run():
     drive = get_drive_service()
 
     # IG token refresh (safe: never raises, alerts on failure, keeps old token)
-    ig_access_token = maybe_refresh_ig_token(drive)
+    # ig_access_token = maybe_refresh_ig_token(drive)
+    ig_access_token = IG_ACCESS_TOKEN
 
     videos_folder_id = find_child_folder(drive, DRIVE_FOLDER_ID, VIDEOS_SUBFOLDER)
     posted_folder_id = find_child_folder(drive, DRIVE_FOLDER_ID, POSTED_SUBFOLDER)
