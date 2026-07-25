@@ -254,14 +254,13 @@ def record_platform_result(ws, row_num, platform_prefix, success, row_num_video,
 # ---------------------------------------------------------------------------
 
 def refresh_ig_token(current_token):
-    """Exchange the current long-lived token for a fresh 60-day one."""
+    """Exchange the current token for a fresh 60-day one, using the
+    correct endpoint for Instagram-Login-issued tokens (IGAA...)."""
     resp = requests.get(
-        f"https://graph.facebook.com/{GRAPH_API_VERSION}/oauth/access_token",
+        "https://graph.instagram.com/refresh_access_token",
         params={
-            "grant_type": "fb_exchange_token",
-            "client_id": FB_APP_ID,
-            "client_secret": FB_APP_SECRET,
-            "fb_exchange_token": current_token,
+            "grant_type": "ig_refresh_token",
+            "access_token": current_token,
         },
         timeout=30,
     ).json()
