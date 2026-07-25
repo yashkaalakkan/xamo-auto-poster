@@ -345,73 +345,105 @@ def maybe_refresh_ig_token(drive):
 # Instagram posting
 # ---------------------------------------------------------------------------
 
-def post_to_instagram(video_local_path, caption, access_token):
-    base_url = "https://graph.instagram.com"  # CHANGED: was graph.facebook.com
+def upload_temp_github_release_asset(local_video_path, filename):
+    """Uploads the video as an asset on a dedicated 'video-hosting' GitHub
+    Release, and returns its public download URL. Creates the release if
+    it doesn't already exist."""
+    headers = {"Authorization": f"Bearer {GH_PAT}", "Accept": "application/vnd.github+json"}
 
-    create_resp = requests.post(
-        f"{base_url}/{IG_USER_ID}/media",
-        data={
-            "media_type": "REELS",
-            "upload_type": "resumable",
-            "caption": caption,
-            "access_token": access_token,
-        },
-    ).json()
+    releases_resp = requests.get(
+        f"https://api.github.com/repos/{GH_REPO}/releases/tags/video-hosting",
+        headers=headers, timeout=20,
+    )
+    if releases_resp.status_code == 200:
+        release = releases_resp.json()
+    else:
+        create_resp = requests.post(
+            f"https://api.github.com/repos/{GH_REPO}/releases",
+            headers=headers,
+            json={"tag_name": "video-hosting", "name": "Temporary video hosting", "draft": False, "prerelease": True},
+            timeout=20,
+        )
+        release = create_resp.json()
 
-    if "id" not in create_resp:
-        log(f"IG: failed to create container: {create_resp}")
-        return False
+    upload_url = release["upload_url"].split("{")[0]
 
-    container_id = create_resp["id"]
-    file_size = os.path.getsize(video_local_path)
+    with open(local_video_path, "rb") as f:
+        upload_resp = requests.post(
+            f"{upload_url}?name={filename}",
+            headers={**headers, "Content-Type": "video/mp4"},
+            data=f,
+            timeout=120,
+        )
+    upload_resp.raise_for_status()
+    asset = upload_resp.json()
+    return asset["browser_download_url"], asset["id"]
 
-    with open(video_local_path, "rb") as f:
-        video_bytes = f.read()
 
-    upload_resp = requests.post(
-        f"https://rupload.facebook.com/ig-api-upload/{GRAPH_API_VERSION}/{container_id}",  # CHANGED: added ig-api-upload/
-        headers={
-            "Authorization": f"OAuth {access_token}",
-            "offset": "0",
-            "file_size": str(file_size),
-        },
-        data=video_bytes,
+def delete_github_release_asset(asset_id):
+    headers = {"Authorization": f"Bearer {GH_PAT}", "Accept": "application/vnd.github+json"}
+    requests.delete(
+        f"https://api.github.com/repos/{GH_REPO}/releases/assets/{asset_id}",
+        headers=headers, timeout=20,
     )
 
-    if upload_resp.status_code != 200:
-        log(f"IG: upload failed: {upload_resp.status_code} {upload_resp.text}")
-        return False
 
-    status = None
-    for _ in range(30):
-        time.sleep(10)
-        status_resp = requests.get(
-            f"{base_url}/{container_id}",
-            params={"fields": "status_code", "access_token": access_token},
+def post_to_instagram(video_local_path, caption, access_token):
+    base_url = "https://graph.instagram.com"
+
+    video_url, asset_id = upload_temp_github_release_asset(video_local_path, os.path.basename(video_local_path))
+    log(f"IG: temporarily hosted video at {video_url}")
+
+    try:
+        create_resp = requests.post(
+            f"{base_url}/{IG_USER_ID}/media",
+            data={
+                "media_type": "REELS",
+                "video_url": video_url,
+                "caption": caption,
+                "access_token": access_token,
+            },
         ).json()
-        status = status_resp.get("status_code")
-        if status == "FINISHED":
-            break
-        if status == "ERROR":
-            log(f"IG: container processing failed: {status_resp}")
+
+        if "id" not in create_resp:
+            log(f"IG: failed to create container: {create_resp}")
             return False
 
-    if status != "FINISHED":
-        log(f"IG: container did not finish processing in time (last status: {status})")
-        return False
+        container_id = create_resp["id"]
 
-    publish_resp = requests.post(
-        f"{base_url}/{IG_USER_ID}/media_publish",
-        data={"creation_id": container_id, "access_token": access_token},
-    ).json()
+        status = None
+        for _ in range(30):
+            time.sleep(10)
+            status_resp = requests.get(
+                f"{base_url}/{container_id}",
+                params={"fields": "status_code", "access_token": access_token},
+            ).json()
+            status = status_resp.get("status_code")
+            if status == "FINISHED":
+                break
+            if status == "ERROR":
+                log(f"IG: container processing failed: {status_resp}")
+                return False
 
-    if "id" not in publish_resp:
-        log(f"IG: publish failed: {publish_resp}")
-        return False
+        if status != "FINISHED":
+            log(f"IG: container did not finish processing in time (last status: {status})")
+            return False
 
-    log(f"IG: published successfully, media id {publish_resp['id']}")
-    return True
+        publish_resp = requests.post(
+            f"{base_url}/{IG_USER_ID}/media_publish",
+            data={"creation_id": container_id, "access_token": access_token},
+        ).json()
 
+        if "id" not in publish_resp:
+            log(f"IG: publish failed: {publish_resp}")
+            return False
+
+        log(f"IG: published successfully, media id {publish_resp['id']}")
+        return True
+
+    finally:
+        delete_github_release_asset(asset_id)
+        log("IG: cleaned up temporary hosted video.")
 
 # ---------------------------------------------------------------------------
 # Facebook Page posting
