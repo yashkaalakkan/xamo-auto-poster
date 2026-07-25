@@ -23,7 +23,7 @@ from nacl import encoding, public
 
 IG_USER_ID = os.environ["IG_USER_ID"]
 IG_ACCESS_TOKEN = os.environ["IG_ACCESS_TOKEN"]
-log(f"DEBUG: IG token length={len(IG_ACCESS_TOKEN)}, starts='{IG_ACCESS_TOKEN[:10]}', ends='{IG_ACCESS_TOKEN[-10:]}', repr_sample={repr(IG_ACCESS_TOKEN[:20])}")
+print(f"DEBUG: IG token length={len(IG_ACCESS_TOKEN)}, starts='{IG_ACCESS_TOKEN[:10]}', ends='{IG_ACCESS_TOKEN[-10:]}', repr_sample={repr(IG_ACCESS_TOKEN[:20])}")
 FB_APP_ID = os.environ["FB_APP_ID"]
 FB_APP_SECRET = os.environ["FB_APP_SECRET"]
 
