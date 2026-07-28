@@ -366,6 +366,18 @@ def upload_temp_github_release_asset(local_video_path, filename):
 
     upload_url = release["upload_url"].split("{")[0]
 
+    # If a stale asset with this same filename is already sitting on the
+    # release (e.g. left over from a previous run that crashed before its
+    # `finally` cleanup ran), GitHub will reject the new upload with a 422
+    # "already_exists" error. Clear it out first so this run isn't blocked.
+    for existing_asset in release.get("assets", []):
+        if existing_asset.get("name") == filename:
+            log(f"IG: found stale leftover asset '{filename}' from a previous run, deleting it first.")
+            requests.delete(
+                f"https://api.github.com/repos/{GH_REPO}/releases/assets/{existing_asset['id']}",
+                headers=headers, timeout=20,
+            )
+
     with open(local_video_path, "rb") as f:
         upload_resp = requests.post(
             f"{upload_url}?name={filename}",
