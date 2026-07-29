@@ -2,7 +2,9 @@ name: Xamo Auto Poster
 
 on:
   schedule:
-    - cron: '0 * * * *' 
+    - cron: '9 * * * *'
+  repository_dispatch:
+    types: [run-poster]
   workflow_dispatch: # Adds a button to let you run it manually
 
 jobs:
