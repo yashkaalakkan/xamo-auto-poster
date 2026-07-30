@@ -722,16 +722,20 @@ def run():
         last_dt = datetime.fromisoformat(last_swept_at)
         sweep_due = (datetime.now(timezone.utc) - last_dt) >= timedelta(hours=YT_MIN_HOURS_BETWEEN_SWEEPS)
 
-    if not sweep_due:
+if not sweep_due:
         log("YT sweep not due yet (last sweep < 4h ago) -- skipping YT this run.")
+    elif current_row_num is None:
+        log("No current IG/FB row yet -- nothing to sweep for YT.")
     else:
         yt_sweep_row_nums = []
         for row_num, row in all_data_rows(ws):
+            if row_num > current_row_num:
+                break
             if row["YT_Status"] not in DONE_STATES:
                 yt_sweep_row_nums.append(row_num)
 
         log(f"YT sweep is due. Rows in this sweep: {yt_sweep_row_nums}")
-
+        
         now = datetime.now(timezone.utc)
         for offset, row_num in enumerate(yt_sweep_row_nums):
             row = get_row_dict(ws, row_num)
