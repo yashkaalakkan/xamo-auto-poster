@@ -135,7 +135,10 @@ def find_child_folder(drive, parent_id, name):
         f"'{parent_id}' in parents and name = '{name}' "
         "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     )
-    results = drive.files().list(q=query, fields="files(id, name)").execute()
+    results = drive.files().list(
+        q=query, fields="files(id, name)",
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
     files = results.get("files", [])
     if not files:
         raise RuntimeError(f"Could not find subfolder '{name}' inside folder {parent_id}")
@@ -144,13 +147,16 @@ def find_child_folder(drive, parent_id, name):
 
 def find_file_in_folder(drive, folder_id, name):
     query = f"'{folder_id}' in parents and name = '{name}' and trashed = false"
-    results = drive.files().list(q=query, fields="files(id, name)").execute()
+    results = drive.files().list(
+        q=query, fields="files(id, name)",
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
     files = results.get("files", [])
     return files[0]["id"] if files else None
 
 
 def download_file(drive, file_id, local_path):
-    request = drive.files().get_media(fileId=file_id)
+    request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
     with io.FileIO(local_path, "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request)
         done = False
@@ -162,11 +168,13 @@ def download_file(drive, file_id, local_path):
 def upload_or_replace_file(drive, folder_id, filename, local_path, existing_file_id=None):
     media = MediaFileUpload(local_path, resumable=True)
     if existing_file_id:
-        drive.files().update(fileId=existing_file_id, media_body=media).execute()
+        drive.files().update(fileId=existing_file_id, media_body=media, supportsAllDrives=True).execute()
         return existing_file_id
     else:
         file_metadata = {"name": filename, "parents": [folder_id]}
-        created = drive.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        created = drive.files().create(
+            body=file_metadata, media_body=media, fields="id", supportsAllDrives=True,
+        ).execute()
         return created["id"]
 
 
@@ -176,6 +184,7 @@ def move_file(drive, file_id, from_folder_id, to_folder_id):
         addParents=to_folder_id,
         removeParents=from_folder_id,
         fields="id, parents",
+        supportsAllDrives=True,
     ).execute()
 
 
@@ -685,24 +694,27 @@ def run():
         )
 
     # =======================================================================
-    # LANE 2: YouTube -- time-marker-based sweep, every ~4 hours.
-    #   - Persist yt_last_swept_row (the row index up through which we've
-    #     already swept) and yt_last_swept_at (timestamp of that sweep).
-    #   - If now - yt_last_swept_at >= 4h: sweep every row strictly AFTER
-    #     yt_last_swept_row, up through and including the current IG/FB row
-    #     (current_row_num) -- however many that is.
-    #   - Each row in the sweep gets one attempt, no retries later
-    #     (attempt_youtube_no_retry). Regardless of success/failure, the
-    #     marker advances to current_row_num / now once the sweep runs.
+    # LANE 2: YouTube -- purely time-gated, per-row independent sweep.
+    #   - The ONLY gate is the 4-hour timer (yt_last_swept_at). Nothing
+    #     about any other row's IG/FB status can block or delay a row.
+    #   - When due, we sweep EVERY row where IG_Status=="posted" and
+    #     FB_Status=="posted" and YT_Status isn't already done -- regardless
+    #     of position, regardless of whether some earlier row is stuck in
+    #     "failed" or "skipped_error". A row that isn't IG+FB posted yet
+    #     simply isn't eligible THIS sweep; it will be picked up on
+    #     whichever future sweep it becomes eligible on, with no risk of
+    #     being permanently skipped over.
+    #   - Each eligible row gets one attempt (attempt_youtube_no_retry) --
+    #     on failure it's labeled "failed" and not retried later (YT itself
+    #     has no strike-counter, per design).
     #   - Videos are all uploaded in this same run; visibility is staggered
     #     via YouTube's publishAt (now, +1h, +2h, +3h, ... in row order).
     # =======================================================================
     sweep_state, sweep_state_file_id = load_json_state(
         drive, DRIVE_FOLDER_ID, YT_SWEEP_STATE_FILENAME,
-        {"yt_last_swept_row": 1, "yt_last_swept_at": None},  # row 1 = header, i.e. "nothing swept yet"
+        {"yt_last_swept_at": None},
     )
 
-    last_swept_row = sweep_state.get("yt_last_swept_row", 1)
     last_swept_at = sweep_state.get("yt_last_swept_at")
 
     sweep_due = True
@@ -712,16 +724,9 @@ def run():
 
     if not sweep_due:
         log("YT sweep not due yet (last sweep < 4h ago) -- skipping YT this run.")
-    elif current_row_num is None:
-        log("YT sweep is due, but there's no current IG/FB row yet -- nothing to sweep.")
     else:
         yt_sweep_row_nums = []
         for row_num, row in all_data_rows(ws):
-            if row_num <= last_swept_row:
-                continue
-            if row_num > current_row_num:
-                break
-            # Only rows that are IG+FB posted are eligible for YT at all.
             if row["IG_Status"] == "posted" and row["FB_Status"] == "posted" and row["YT_Status"] not in DONE_STATES:
                 yt_sweep_row_nums.append(row_num)
 
@@ -752,9 +757,9 @@ def run():
             if attempted:
                 any_attempted = True
 
-        # Marker advances regardless of per-row success/failure -- this is
-        # what makes failed rows in this sweep "abandoned" going forward.
-        sweep_state["yt_last_swept_row"] = current_row_num
+        # Only the timestamp needs to persist now -- eligibility is always
+        # recomputed fresh from each row's own status, so there's no marker
+        # row to save, and therefore nothing that can strand a row.
         sweep_state["yt_last_swept_at"] = datetime.now(timezone.utc).isoformat()
         save_json_state(drive, DRIVE_FOLDER_ID, YT_SWEEP_STATE_FILENAME, sweep_state, sweep_state_file_id)
 
