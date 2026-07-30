@@ -727,7 +727,7 @@ def run():
     else:
         yt_sweep_row_nums = []
         for row_num, row in all_data_rows(ws):
-            if row["IG_Status"] == "posted" and row["FB_Status"] == "posted" and row["YT_Status"] not in DONE_STATES:
+            if row["YT_Status"] not in DONE_STATES:
                 yt_sweep_row_nums.append(row_num)
 
         log(f"YT sweep is due. Rows in this sweep: {yt_sweep_row_nums}")
