@@ -722,7 +722,7 @@ def run():
         last_dt = datetime.fromisoformat(last_swept_at)
         sweep_due = (datetime.now(timezone.utc) - last_dt) >= timedelta(hours=YT_MIN_HOURS_BETWEEN_SWEEPS)
 
-if not sweep_due:
+    if not sweep_due:
         log("YT sweep not due yet (last sweep < 4h ago) -- skipping YT this run.")
     elif current_row_num is None:
         log("No current IG/FB row yet -- nothing to sweep for YT.")
