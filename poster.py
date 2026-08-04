@@ -1470,7 +1470,7 @@ def run():
 
     for row_num, row in all_data_rows(ws):
         # Skip rows that are entirely done already.
-        if row_fully_posted(row):
+        if row["IG_Status"] in DONE_STATES and row["FB_Status"] in DONE_STATES:
             continue
         # Skip rows permanently dead on download.
         if row["DL_Status"] == "skipped_error":
