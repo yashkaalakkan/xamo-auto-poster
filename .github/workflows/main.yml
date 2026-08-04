@@ -1,6 +1,58 @@
+# name: Xamo Auto Poster
+
+# on:
+#   repository_dispatch:
+#     types: [run-poster]
+#   workflow_dispatch: # Adds a button to let you run it manually
+
+# jobs:
+#   post-videos:
+#     runs-on: ubuntu-latest
+#     env:
+#       IG_USER_ID: ${{ secrets.IG_USER_ID }}
+#       IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+#       FB_APP_ID: ${{ secrets.FB_APP_ID }}
+#       FB_APP_SECRET: ${{ secrets.FB_APP_SECRET }}
+#       FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+#       FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+#       YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+#       YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+#       YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+#       GOOGLE_DRIVE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS_JSON }}
+#       DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+#       HEALTHCHECK_PING_URL: ${{ secrets.HEALTHCHECK_PING_URL }}
+#       GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+#       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+#       CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
+#       CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
+#       GH_PAT: ${{ secrets.GH_PAT }}
+
+#     steps:
+#       - name: Checkout repository
+#         uses: actions/checkout@v3
+
+#       - name: Set up Python
+#         uses: actions/setup-python@v4
+#         with:
+#           python-version: '3.10'
+
+#       - name: Install dependencies
+#         run: pip install -r requirements.txt
+
+#       - name: Run Auto Poster Script
+#         run: python poster.py
+
+
+
+
+
+
+
 name: Xamo Auto Poster
 
 on:
+  schedule:
+    - cron: '39 * * * *'
   repository_dispatch:
     types: [run-poster]
   workflow_dispatch: # Adds a button to let you run it manually
@@ -35,6 +87,9 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Install dependencies
         run: pip install -r requirements.txt
