@@ -5,6 +5,7 @@ import time
 import sys
 import base64
 import smtplib
+import re
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 
@@ -675,6 +676,7 @@ def run():
         row = get_row_dict(ws, row_num)
         video_filename = row["VideoFilename"]
         caption = row["Caption"] or ""
+        caption = re.sub(r'@[A-Za-z0-9._]+(?<!\.)', '@xamox_amo', caption)
 
         video_file_id = find_file_in_folder(drive, videos_folder_id, video_filename)
         if not video_file_id:
@@ -742,6 +744,7 @@ def run():
             video_filename = row["VideoFilename"]
             yt_title = row["YT_Title"] or video_filename
             caption = row["Caption"] or ""
+            caption = re.sub(r'@[A-Za-z0-9._]+(?<!\.)', '@xamox_amo', caption)
 
             video_file_id = find_video_anywhere(drive, videos_folder_id, posted_folder_id, video_filename)
             if not video_file_id:
@@ -820,6 +823,7 @@ if __name__ == "__main__":
 # import base64
 # import shutil
 # import smtplib
+# import re
 # import subprocess
 # from email.mime.text import MIMEText
 # from datetime import datetime, timezone, timedelta
@@ -1206,6 +1210,8 @@ if __name__ == "__main__":
 #     pad_ok, pad_msg = pad_to_vertical(dest_path)
 #     if not pad_ok:
 #         return False, None, f"9:16 padding failed: {pad_msg}"
+
+#     caption = re.sub(r'@[A-Za-z0-9._]+(?<!\.)', '@xamox_amo', caption)
 
 #     return True, caption, None
 
