@@ -882,7 +882,7 @@ MAX_FAILURES_PER_PLATFORM = 3
 IG_TOKEN_REFRESH_AFTER_DAYS = 50
 
 # Every Nth successful run also gets a YouTube upload for that run's row.
-YT_EVERY_N_RUNS = 4
+YT_EVERY_N_RUNS = 8
 
 # Used as the caption/description whenever a downloaded video has no
 # description of its own.
