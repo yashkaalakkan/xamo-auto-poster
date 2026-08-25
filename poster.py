@@ -1307,12 +1307,28 @@ def post_to_instagram(video_local_path, caption, access_token):
             data={"creation_id": container_id, "access_token": access_token},
         ).json()
 
-        if "id" not in publish_resp:
-            log(f"IG: publish failed: {publish_resp}")
-            return False
+        if "id" in publish_resp:
+            log(f"IG: published successfully, media id {publish_resp['id']}")
+            return True
 
-        log(f"IG: published successfully, media id {publish_resp['id']}")
-        return True
+        # The publish call itself can return a transient-looking error even
+        # when the post actually went through server-side (known Graph API
+        # quirk). Before treating this as a real failure, double check the
+        # container's own status -- if it now reports PUBLISHED, the post
+        # succeeded despite the misleading error response, so don't retry
+        # (which would create a duplicate post).
+        log(f"IG: publish call returned no id, checking container status before giving up: {publish_resp}")
+        time.sleep(5)
+        recheck_resp = requests.get(
+            f"{base_url}/{container_id}",
+            params={"fields": "status_code", "access_token": access_token},
+        ).json()
+        if recheck_resp.get("status_code") == "PUBLISHED":
+            log("IG: container status confirms it WAS published despite the error response. Treating as success.")
+            return True
+
+        log(f"IG: publish genuinely failed: {publish_resp}")
+        return False
     finally:
         delete_github_release_asset(asset_id)
         log("IG: cleaned up temporary hosted video.")
