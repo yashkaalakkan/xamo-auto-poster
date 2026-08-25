@@ -1577,7 +1577,7 @@ def run():
 
         ig_ok = attempt_with_retries(
             ws, downloaded_row_num, row, "IG_Status", "IG_Fails", "IG_PostedAt",
-            "Instagram", lambda: post_to_instagram(downloaded_local_path, caption, ig_access_token),
+            "Instagram", lambda: post_to_instagram(downloaded_local_path, caption, ig_access_token, COVER_IMAGE_PATH),
         )
         row = get_row_dict(ws, downloaded_row_num)
         fb_ok = attempt_with_retries(
