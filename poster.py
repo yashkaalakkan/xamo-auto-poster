@@ -886,7 +886,8 @@ YT_EVERY_N_RUNS = 8
 
 # Used as the caption/description whenever a downloaded video has no
 # description of its own.
-DEFAULT_CAPTION = "Follow for more #viral #reels #shorts"
+DEFAULT_CAPTION = "Tonight, V stepped into the crowd, taking in live performances at Vogue World: Hollywood. Known for his own standout fashion moments, he kept it effortlessly stylish in a look worthy of the runway."
+COVER_IMAGE_PATH = "assets/cover.jpg"
 
 QUEUE_FILENAME = "queue.xlsx"
 TOKEN_STATE_FILENAME = "token_state.json"
@@ -1268,16 +1269,30 @@ def delete_github_release_asset(asset_id):
     )
 
 
-def post_to_instagram(video_local_path, caption, access_token):
+def post_to_instagram(video_local_path, caption, access_token, cover_image_path=None):
     base_url = "https://graph.instagram.com"
     video_url, asset_id = upload_temp_github_release_asset(video_local_path, os.path.basename(video_local_path))
     log(f"IG: temporarily hosted video at {video_url}")
 
+    cover_url = None
+    cover_asset_id = None
+    if cover_image_path:
+        cover_url, cover_asset_id = upload_temp_github_release_asset(
+            cover_image_path, os.path.basename(cover_image_path)
+        )
+        log(f"IG: temporarily hosted cover image at {cover_url}")
+
     try:
-        create_resp = requests.post(
-            f"{base_url}/{IG_USER_ID}/media",
-            data={"media_type": "REELS", "video_url": video_url, "caption": caption, "access_token": access_token},
-        ).json()
+        media_data = {
+            "media_type": "REELS",
+            "video_url": video_url,
+            "caption": caption,
+            "access_token": access_token,
+        }
+        if cover_url:
+            media_data["cover_url"] = cover_url
+
+        create_resp = requests.post(f"{base_url}/{IG_USER_ID}/media", data=media_data).json()
 
         if "id" not in create_resp:
             log(f"IG: failed to create container: {create_resp}")
@@ -1311,12 +1326,6 @@ def post_to_instagram(video_local_path, caption, access_token):
             log(f"IG: published successfully, media id {publish_resp['id']}")
             return True
 
-        # The publish call itself can return a transient-looking error even
-        # when the post actually went through server-side (known Graph API
-        # quirk). Before treating this as a real failure, double check the
-        # container's own status -- if it now reports PUBLISHED, the post
-        # succeeded despite the misleading error response, so don't retry
-        # (which would create a duplicate post).
         log(f"IG: publish call returned no id, checking container status before giving up: {publish_resp}")
         time.sleep(5)
         recheck_resp = requests.get(
@@ -1329,10 +1338,12 @@ def post_to_instagram(video_local_path, caption, access_token):
 
         log(f"IG: publish genuinely failed: {publish_resp}")
         return False
+
     finally:
         delete_github_release_asset(asset_id)
-        log("IG: cleaned up temporary hosted video.")
-
+        if cover_asset_id:
+            delete_github_release_asset(cover_asset_id)
+        log("IG: cleaned up temporary hosted video (and cover, if any).")
 
 # ---------------------------------------------------------------------------
 # Facebook Page posting
